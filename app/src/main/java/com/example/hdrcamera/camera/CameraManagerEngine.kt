@@ -24,10 +24,13 @@ import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 
-private data class CaptureData(
+private data class BurstCaptureData(
+    val expectedFrames: Int,
     val params: FilterParameters,
     val isPortraitMode: Boolean,
-    val callback: (android.net.Uri?, android.graphics.Bitmap?) -> Unit
+    val bokehAperture: Float = 2.8f,
+    val callback: (android.net.Uri?, android.graphics.Bitmap?) -> Unit,
+    val frames: MutableList<ByteArray> = mutableListOf()
 )
 
 class CameraManagerEngine(
@@ -61,9 +64,10 @@ class CameraManagerEngine(
 
     var onSessionConfigured: ((Boolean) -> Unit)? = null
     var onCaptureStateChanged: ((Boolean) -> Unit)? = null
+    var onProcessingStateChanged: ((Boolean) -> Unit)? = null
 
-    // Single-shot pending capture callback reference
-    private val pendingCapture = AtomicReference<CaptureData?>()
+    // Burst capture tracking reference
+    private val pendingBurst = AtomicReference<BurstCaptureData?>()
 
     init {
         startBackgroundThread()
@@ -99,20 +103,25 @@ class CameraManagerEngine(
         surfaceTexture.setDefaultBufferSize(previewSize.width, previewSize.height)
         previewSurface = Surface(surfaceTexture)
 
-        // Setup capture ImageReader
+        // Setup capture ImageReader with 6-image capacity for zero-drop burst buffering
         val photoSize = cameraInfo.maxPhotoSize
-        Log.i(TAG, "Setting up capture ImageReader: ${photoSize.width}x${photoSize.height} for camera ${cameraInfo.cameraId} (facing $currentFacing)")
+        Log.i(TAG, "Setting up burst ImageReader: ${photoSize.width}x${photoSize.height} for camera ${cameraInfo.cameraId} (facing $currentFacing)")
 
         val reader = ImageReader.newInstance(
             photoSize.width,
             photoSize.height,
             ImageFormat.JPEG,
-            2
+            6
         )
         imageReader = reader
 
         reader.setOnImageAvailableListener({ r ->
-            val image = r.acquireLatestImage()
+            val image = try {
+                r.acquireNextImage()
+            } catch (e: Exception) {
+                Log.w(TAG, "Exception acquiring image from ImageReader: ${e.message}")
+                null
+            }
             if (image != null) {
                 val plane = image.planes[0]
                 val buffer = plane.buffer
@@ -120,24 +129,19 @@ class CameraManagerEngine(
                 buffer.get(bytes)
                 image.close()
 
-                val captureInfo = pendingCapture.getAndSet(null)
-                if (captureInfo != null) {
-                    val rotation = cameraInfo.sensorOrientation
-                    val isFront = (currentFacing == CameraCharacteristics.LENS_FACING_FRONT)
-                    CoroutineScope(Dispatchers.IO).launch {
-                        processor.processAndSaveImage(
-                            jpegBytes = bytes,
-                            params = captureInfo.params,
-                            rotationDegrees = rotation,
-                            isFrontCamera = isFront,
-                            isPortraitMode = captureInfo.isPortraitMode
-                        ) { uri, thumb ->
-                            onCaptureStateChanged?.invoke(false)
-                            captureInfo.callback(uri, thumb)
+                val burst = pendingBurst.get()
+                if (burst != null) {
+                    var shouldDispatch = false
+                    synchronized(burst.frames) {
+                        burst.frames.add(bytes)
+                        if (burst.frames.size >= burst.expectedFrames) {
+                            shouldDispatch = true
+                            pendingBurst.compareAndSet(burst, null)
                         }
                     }
-                } else {
-                    onCaptureStateChanged?.invoke(false)
+                    if (shouldDispatch) {
+                        dispatchBurstToProcessor(burst)
+                    }
                 }
             }
         }, backgroundHandler)
@@ -337,9 +341,32 @@ class CameraManagerEngine(
         }
     }
 
+    private fun dispatchBurstToProcessor(burst: BurstCaptureData) {
+        val cameraInfo = characteristicsHelper.getCameraInfo(currentFacing)
+        val rotation = cameraInfo?.sensorOrientation ?: 90
+        val isFront = (currentFacing == CameraCharacteristics.LENS_FACING_FRONT)
+        val framesCopy = synchronized(burst.frames) { burst.frames.toList() }
+
+        CoroutineScope(Dispatchers.IO).launch {
+            processor.processAndSaveBurst(
+                jpegFrames = framesCopy,
+                params = burst.params,
+                rotationDegrees = rotation,
+                isFrontCamera = isFront,
+                isPortraitMode = burst.isPortraitMode,
+                bokehAperture = burst.bokehAperture
+            ) { uri, thumb ->
+                onProcessingStateChanged?.invoke(false)
+                burst.callback(uri, thumb)
+            }
+        }
+    }
+
     fun takePicture(
         params: FilterParameters,
         isPortraitMode: Boolean = false,
+        burstCount: Int = 3,
+        bokehAperture: Float = 2.8f,
         onPhotoProcessed: (android.net.Uri?, android.graphics.Bitmap?) -> Unit
     ) {
         val camera = cameraDevice ?: return
@@ -347,30 +374,79 @@ class CameraManagerEngine(
         val reader = imageReader ?: return
         val cameraInfo = characteristicsHelper.getCameraInfo(currentFacing)
 
+        // 1. Instant shutter animation & flash trigger
         onCaptureStateChanged?.invoke(true)
-        pendingCapture.set(CaptureData(params, isPortraitMode, onPhotoProcessed))
+        onProcessingStateChanged?.invoke(true)
+
+        val frameCount = if (burstCount in 1..5) burstCount else 3
+        val burstData = BurstCaptureData(
+            expectedFrames = frameCount,
+            params = params,
+            isPortraitMode = isPortraitMode,
+            bokehAperture = bokehAperture,
+            callback = onPhotoProcessed
+        )
+        pendingBurst.set(burstData)
 
         try {
-            val captureBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(reader.surface)
-                set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
-                set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
-                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentExposureIndex)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoomRatio)
-                }
-                cameraInfo?.sensorOrientation?.let { orientation ->
-                    set(CaptureRequest.JPEG_ORIENTATION, orientation)
-                }
-                set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+            val requests = (0 until frameCount).map {
+                camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                    addTarget(reader.surface)
+                    set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
+                    set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
+                    set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentExposureIndex)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        set(CaptureRequest.CONTROL_ZOOM_RATIO, currentZoomRatio)
+                    }
+                    cameraInfo?.sensorOrientation?.let { orientation ->
+                        set(CaptureRequest.JPEG_ORIENTATION, orientation)
+                    }
+                    set(CaptureRequest.JPEG_QUALITY, 95.toByte())
+                }.build()
             }
 
-            session.capture(captureBuilder.build(), null, backgroundHandler)
+            session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureSequenceCompleted(
+                    session: CameraCaptureSession,
+                    sequenceId: Int,
+                    frameNumber: Long
+                ) {
+                    // Sensor finished readout of all burst frames: release UI shutter lock immediately
+                    onCaptureStateChanged?.invoke(false)
+                }
+
+                override fun onCaptureFailed(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    failure: CaptureFailure
+                ) {
+                    Log.w(TAG, "Capture failed in burst: reason=${failure.reason}")
+                }
+            }, backgroundHandler)
+
+            // Safety timeout to prevent UI lockup if a hardware frame drop occurs
+            backgroundHandler?.postDelayed({
+                val pending = pendingBurst.getAndSet(null)
+                if (pending != null) {
+                    val framesCount = synchronized(pending.frames) { pending.frames.size }
+                    if (framesCount > 0) {
+                        Log.w(TAG, "Burst safety timeout fired; processing $framesCount frames")
+                        dispatchBurstToProcessor(pending)
+                    } else {
+                        Log.e(TAG, "Burst safety timeout with 0 frames received")
+                        onCaptureStateChanged?.invoke(false)
+                        onProcessingStateChanged?.invoke(false)
+                        pending.callback(null, null)
+                    }
+                }
+            }, 2000)
+
         } catch (e: Exception) {
-            Log.e(TAG, "Failed taking picture", e)
-            pendingCapture.set(null)
+            Log.e(TAG, "Failed taking burst picture", e)
+            pendingBurst.set(null)
             onCaptureStateChanged?.invoke(false)
+            onProcessingStateChanged?.invoke(false)
         }
     }
 

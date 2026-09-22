@@ -70,6 +70,8 @@ fun CameraScreen(
     var selectedLensZoom by remember { mutableStateOf(1.0f) }
     var is10BitActive by remember { mutableStateOf(false) }
     var isCapturing by remember { mutableStateOf(false) }
+    var isProcessingBurst by remember { mutableStateOf(false) }
+    var portraitAperture by remember { mutableStateOf(2.8f) }
     var isFrontCamera by remember { mutableStateOf(cameraEngine.currentFacing == CameraCharacteristics.LENS_FACING_FRONT) }
 
     var showTuningPanel by remember { mutableStateOf(false) }
@@ -102,6 +104,9 @@ fun CameraScreen(
         }
         cameraEngine.onCaptureStateChanged = { capturing ->
             isCapturing = capturing
+        }
+        cameraEngine.onProcessingStateChanged = { processing ->
+            isProcessingBurst = processing
         }
         cameraEngine.onFacingChanged = { facing ->
             isFrontCamera = (facing == CameraCharacteristics.LENS_FACING_FRONT)
@@ -239,6 +244,35 @@ fun CameraScreen(
                         fontSize = 11.sp,
                         fontWeight = FontWeight.Bold
                     )
+                }
+
+                // HDR+ Multi-Frame Fusion Active Badge
+                AnimatedVisibility(
+                    visible = isProcessingBurst,
+                    enter = fadeIn() + expandHorizontally(),
+                    exit = fadeOut() + shrinkHorizontally()
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(Color(0x44FFB300))
+                            .border(1.dp, AccentGold, RoundedCornerShape(20.dp))
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(10.dp),
+                            color = AccentGold,
+                            strokeWidth = 1.5.dp
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "HDR+ FUSION",
+                            color = AccentGold,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
 
                 // Portrait Indicator Badge if in Portrait mode
@@ -571,7 +605,56 @@ fun CameraScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(10.dp))
+            // Portrait Optical Aperture Selector (f/1.4 to f/5.6)
+            AnimatedVisibility(
+                visible = currentMode == CameraAppMode.PORTRAIT,
+                enter = fadeIn() + expandVertically(),
+                exit = fadeOut() + shrinkVertically()
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 24.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val apertures = listOf(
+                        1.4f to "f/1.4",
+                        2.0f to "f/2.0",
+                        2.8f to "f/2.8",
+                        4.0f to "f/4.0",
+                        5.6f to "f/5.6"
+                    )
+                    Text(
+                        text = "BOKEH",
+                        color = AccentGold,
+                        fontSize = 10.sp,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(end = 8.dp)
+                    )
+                    apertures.forEach { (ap, label) ->
+                        val isSel = portraitAperture == ap
+                        Box(
+                            modifier = Modifier
+                                .padding(horizontal = 3.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (isSel) AccentGold else Color(0x33222630))
+                                .border(1.dp, if (isSel) AccentGold else Color(0x22FFFFFF), RoundedCornerShape(8.dp))
+                                .clickable { portraitAperture = ap }
+                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (isSel) Color.Black else TextPrimary,
+                                fontSize = 11.sp,
+                                fontWeight = if (isSel) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
 
             // C. Camera Mode Selector (PHOTO | PORTRAIT | PRO HDR)
             Row(
@@ -613,13 +696,30 @@ fun CameraScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Gallery Thumbnail Preview
+                // Gallery Thumbnail Preview with HDR+ processing indicator
+                val burstTransition = rememberInfiniteTransition(label = "burst_proc_anim")
+                val spinDegree by burstTransition.animateFloat(
+                    initialValue = 0f,
+                    targetValue = 360f,
+                    animationSpec = infiniteRepeatable(
+                        animation = tween(1200, easing = LinearEasing),
+                        repeatMode = RepeatMode.Restart
+                    ),
+                    label = "gallery_spin_angle"
+                )
+
                 Box(
                     modifier = Modifier
                         .size(54.dp)
                         .clip(RoundedCornerShape(12.dp))
                         .background(Color(0x331E222D))
-                        .border(1.dp, Color(0x33FFFFFF), RoundedCornerShape(12.dp))
+                        .border(
+                            width = if (isProcessingBurst) 2.dp else 1.dp,
+                            brush = if (isProcessingBurst) Brush.sweepGradient(
+                                listOf(AccentGold, AccentCyan, Color.Transparent, AccentGold)
+                            ) else Brush.linearGradient(listOf(Color(0x33FFFFFF), Color(0x33FFFFFF))),
+                            shape = RoundedCornerShape(12.dp)
+                        )
                         .clickable {
                             if (lastPhotoThumb != null || lastPhotoUri != null) {
                                 showQuickPreview = true
@@ -652,6 +752,21 @@ fun CameraScreen(
                             modifier = Modifier.size(24.dp)
                         )
                     }
+
+                    if (isProcessingBurst) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.5f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                color = AccentGold,
+                                strokeWidth = 2.dp
+                            )
+                        }
+                    }
                 }
 
                 // Shutter Button
@@ -663,7 +778,12 @@ fun CameraScreen(
                         .border(3.dp, Color.White, CircleShape)
                         .clickable(enabled = !isCapturing) {
                             val isPortrait = (currentMode == CameraAppMode.PORTRAIT)
-                            cameraEngine.takePicture(currentParams, isPortraitMode = isPortrait) { uri, thumb ->
+                            cameraEngine.takePicture(
+                                params = currentParams,
+                                isPortraitMode = isPortrait,
+                                burstCount = 3,
+                                bokehAperture = portraitAperture
+                            ) { uri, thumb ->
                                 lastPhotoUri = uri
                                 lastPhotoThumb = thumb
                             }
